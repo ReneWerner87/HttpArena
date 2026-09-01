@@ -101,8 +101,9 @@ manager: one worker process per CPU the container is given.
   trusted boundary, prefer container isolation), which is exactly one benchmark container.
 - The board already runs this way. `express`, `fastify` and `koa` fork one cluster worker per
   core, `aiohttp` describes itself as "one forked worker per core sharing the port with
-  SO_REUSEPORT", and all of them are `mode: standard` — 37 standard entries fork per core or
-  take a reuseport socket.
+  SO_REUSEPORT", and all of them are `mode: standard`. Counted in the sources rather than in
+  the prose — a `SO_REUSEPORT` socket, a `prefork` manager or a `cluster.fork` in an entry's
+  own code or build files — 34 standard entries run this way, this one included.
 - The socket options that come with it are settled here too. `go-fasthttp` — flagship, standard,
   on the same profiles — calls the identical `reuseport.Listen`, and `axum` added one
   `SO_REUSEPORT` listener per core in
@@ -112,7 +113,7 @@ The counter-argument, stated because a reviewer will find it: read literally, th
 profile's standard rule ("no worker count beyond framework defaults", "No custom TCP tuning")
 and `short-lived`'s tuned side ("May optimize connection recycling, TCP fast-open, and socket
 reuse settings") put both halves of this on the tuned side. That reading is available — but it
-reclassifies 37 entries, `go-fasthttp` and `axum` among them, not this one alone.
+reclassifies the other 33, `go-fasthttp` and `axum` among them, not this one alone.
 
 - The master binds nothing. It re-executes the binary `GOMAXPROCS` times with
   `FASTHTTP_PREFORK_CHILD=1` set, then supervises: a worker that dies is replaced, until the
