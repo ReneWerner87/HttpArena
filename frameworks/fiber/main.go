@@ -132,6 +132,10 @@ func jsonItems(c fiber.Ctx) error {
 	if count > len(dataset) {
 		count = len(dataset)
 	}
+	// An explicit m=0 reads as "not given", the same as an absent or unparsable
+	// one. Every entry in the repo does this and the profiles only ever send
+	// m >= 1, so the alternative is a column of zero totals that nothing asks
+	// for and that no other row would report.
 	m := fiber.Query[int](c, "m", 1)
 	if m == 0 {
 		m = 1
