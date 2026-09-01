@@ -31,13 +31,13 @@ Fiber web framework on fasthttp, with prefork for multi-core scaling.
   largest body anything sends this entry (100 KB, in the `8gbit` validation). What is not
   default is in `ListenConfig`: `EnablePrefork` (the section below) and `DisableStartupMessage`,
   which only silences a banner.
+- One worker process per CPU the container is given, through Fiber's `EnablePrefork`: the
+  master binds nothing and every worker accepts on its own `SO_REUSEPORT` socket. The section
+  below has the mechanics and what it costs.
 - Routing and binding through the Fiber API: `/baseline11` reads its two operands with
   `fiber.Query[int]`, `/json/{count}`, `/delay/{ms}` and `/crud/items/{id}` read their path
   parameter with `fiber.Params[int]`, and `/async-db` and `/crud/items` read theirs with
   `fiber.Query[int]` as well. No request materialises the query string into a map.
-- One worker process per CPU the container is given, through Fiber's `EnablePrefork`: the
-  master binds nothing and every worker accepts on its own `SO_REUSEPORT` socket. The section
-  below has the mechanics and what it costs.
 - JSON through `c.JSON`, serialized per request.
 - The `compress` middleware is mounted on `/json` and `/static` rather than on the whole app.
   What that leaves out is either answered in a handful of bytes — `/pipeline`, `/baseline11`,
