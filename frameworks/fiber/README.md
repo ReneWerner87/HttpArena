@@ -109,11 +109,22 @@ manager: one worker process per CPU the container is given.
   `SO_REUSEPORT` listener per core in
   [#1361](https://github.com/MDA2AV/HttpArena/pull/1361) and stayed standard.
 
-The counter-argument, stated because a reviewer will find it: read literally, the `baseline`
-profile's standard rule ("no worker count beyond framework defaults", "No custom TCP tuning")
-and `short-lived`'s tuned side ("May optimize connection recycling, TCP fast-open, and socket
-reuse settings") put both halves of this on the tuned side. That reading is available — but it
-reclassifies the other 33, `go-fasthttp` and `axum` among them, not this one alone.
+The counter-argument, stated because a reviewer will find it: the `baseline` profile's standard
+rule reads narrower than the mode page — "No custom TCP tuning, no experimental flags, no worker
+count beyond framework defaults." Two pages, one question, opposite answers. It resolves the way
+it does here for two reasons. `standard.md` is the mode's own rules page and is explicit twice
+over, while the profile string is a one-line summary of it; and the socket options are not this
+entry's to begin with — `reuseport.Listen` is what fasthttp's own prefork path calls, so what a
+reviewer would be pricing is a framework default rather than something this entry set — the
+distinction `standard.md` draws in its static-file section, "what the framework gives you, not
+what can be written against it", applied to sockets instead of caches. Taking the narrow reading
+instead does not reclassify this entry alone: it reclassifies the other 33, `go-fasthttp` and
+`axum` among them.
+
+`short-lived` is sometimes cited here too and does not belong in the argument: its standard rule
+is about keep-alive and connection pooling ("Must use the framework default connection handling.
+No custom keep-alive tuning or connection pooling optimizations"), and what its tuned side lists
+as permitted for tuned entries says nothing about what standard ones may do.
 
 - The master binds nothing. It re-executes the binary `GOMAXPROCS` times with
   `FASTHTTP_PREFORK_CHILD=1` set, then supervises: a worker that dies is replaced, until the
