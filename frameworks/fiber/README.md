@@ -1,6 +1,6 @@
 # fiber
 
-Fiber web framework on fasthttp, default configuration.
+Fiber web framework on fasthttp, with prefork for multi-core scaling.
 
 ## Stack
 
@@ -63,10 +63,32 @@ shape.
 
 ## Prefork
 
-Off here. Fiber's prefork spawns one child process per core, each with its own
-`SO_REUSEPORT` listener, which is a worker count past the framework default and
-therefore not a standard-mode setting. The switch lives in this source
-(`FIBER_PREFORK`, a Docker build argument) and the
-[`fiber-prefork`](../fiber-prefork/) entry is the tuned row that turns it on —
-same code, same handlers, so the difference between the two rows on the board is
-the process model and nothing else.
+`app.Listen(":8080", fiber.ListenConfig{EnablePrefork: true})` hands off to
+fasthttp's prefork manager, which is Fiber's answer to the same problem Node's
+`cluster` module solves for the `express`, `fastify` and `koa` entries and
+`SO_REUSEPORT` forking solves for `aiohttp`: one worker per core, which is the
+worker count the implementation rules permit an entry to match.
+
+- The master process binds nothing. It re-executes the binary `GOMAXPROCS` times
+  with `FASTHTTP_PREFORK_CHILD=1` set and then supervises, restarting a child
+  that dies. Children notice a dead master by their parent pid changing and exit.
+- Each child calls `reuseport.Listen` for itself and sets `GOMAXPROCS(1)`, so the
+  container runs one Go runtime per core rather than one runtime scheduling every
+  core. The kernel spreads accepted connections across the listening sockets.
+- The TLS listener on `8081` is opened the same way, once per child. In a child
+  `EnablePrefork` means "take the `SO_REUSEPORT` socket for this address", not
+  "fork again", and without it every child would race for an ordinary bind and
+  all but one would lose it — silently, before the error was logged.
+- The dataset, the Postgres pool and the Redis client are loaded only where
+  `fiber.IsChild()` is true. The master has no use for them, and a pool opened
+  before the fork would hand the same connections to every child.
+- Anything the container holds once is divided by the child count. The Postgres
+  pool is the one that matters: `DATABASE_MAX_CONN` is a budget for the
+  container, not for a process, and a pool sized for one process would have the
+  fleet asking for sixty-four times what the server will hand out.
+
+What it costs is one Go runtime per core — N heaps, N garbage collectors, N sets
+of background threads — paid for whether or not requests are arriving, which is
+what the two fixed-rate profiles measure. `/benchmark -f fiber` reports the
+deltas against this entry's results on `main`, so that trade is a number rather
+than an argument.

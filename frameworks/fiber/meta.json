@@ -10,7 +10,7 @@
     "response": true
   },
   "engine": "fasthttp",
-  "description": "Fiber 3 on fasthttp, default configuration - one process, no prefork. Routing and typed path/query binding through the Fiber API, JSON via c.JSON, gzip and brotli through the Fiber compress middleware. Static files are read from disk per request, taking the pre-compressed .br/.gz twin the harness ships beside each file when the client accepts one. SIGTERM drains through ListenConfig.GracefulContext. The fiber-prefork entry is the same source with prefork switched on.",
+  "description": "Fiber 3 on fasthttp with prefork for multi-core scaling: one child process per core, each accepting on its own SO_REUSEPORT socket on 8080 and on the TLS listener alike, and the Postgres budget divided across them. Routing and typed path/query binding through the Fiber API, JSON via c.JSON, gzip and brotli through the Fiber compress middleware. Static files are read from disk per request, taking the pre-compressed .br/.gz twin the harness ships beside each file when the client accepts one. SIGTERM drains through ListenConfig.GracefulContext.",
   "repo": "https://github.com/gofiber/fiber",
   "enabled": true,
   "tests": [

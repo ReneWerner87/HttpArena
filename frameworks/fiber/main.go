@@ -21,23 +21,14 @@ import (
 
 const maxBody = 25 * 1024 * 1024
 
-// Prefork is decided at image build time: the Dockerfile takes FIBER_PREFORK as
-// a build argument and the fiber-prefork entry builds this same source with it
-// set to 1. One child process per core is a worker count past the framework
-// default, which standard mode does not allow, so the switch stays off here and
-// the tuned sibling is the entry that turns it on.
-var preforkEnabled = os.Getenv("FIBER_PREFORK") == "1"
-
-// preforkWorkers is how many processes end up sharing anything the container
-// holds once - the connection budget below, most of all. fasthttp forks
-// GOMAXPROCS children, read in the master before it spawns anything; a child
-// re-runs main() from the top and reads the same value here, because the
-// GOMAXPROCS(1) that prefork applies to a child happens later, when it takes
-// its listener.
-func preforkWorkers() int {
-	if !preforkEnabled {
-		return 1
-	}
+// workerProcesses is how many processes end up sharing anything the container
+// holds once - the connection budget below, most of all.
+//
+// Prefork forks GOMAXPROCS children, the value read in the master before it
+// spawns anything. A child re-runs main() from the top and reads the same
+// number here, because the GOMAXPROCS(1) that prefork applies to a child
+// happens later, when it takes its listener.
+func workerProcesses() int {
 	return runtime.GOMAXPROCS(0)
 }
 
@@ -171,7 +162,7 @@ func loadPgPool() {
 			budget = n
 		}
 	}
-	workers := preforkWorkers()
+	workers := workerProcesses()
 	maxConns := (budget - 8) / workers
 	if m := runtime.NumCPU() * 4 / workers; m < maxConns {
 		maxConns = m
@@ -488,12 +479,13 @@ func staticFile(c fiber.Ctx) error {
 }
 
 func main() {
-	// Under prefork the master process supervises children and nothing else: it
-	// binds no socket and serves no request, so the dataset, the pool and the
-	// cache client belong in the children. Each of those re-runs main() from
-	// the top with the marker environment variable set, which is what
-	// fiber.IsChild reads.
-	serving := !preforkEnabled || fiber.IsChild()
+	// The master process supervises children and nothing else: it binds no
+	// socket and serves no request, so the dataset, the pool and the cache
+	// client belong in the children. Each of those re-runs main() from the top
+	// with the marker environment variable set, which is what fiber.IsChild
+	// reads - and loading the pool there rather than here is also what keeps a
+	// live connection out of the process that forks.
+	serving := fiber.IsChild()
 	if serving {
 		loadDataset()
 		loadPgPool()
@@ -528,7 +520,7 @@ func main() {
 
 	listen := fiber.ListenConfig{
 		DisableStartupMessage: true,
-		EnablePrefork:         preforkEnabled,
+		EnablePrefork:         true,
 	}
 
 	if serving {
@@ -559,7 +551,7 @@ func main() {
 					DisableStartupMessage: true,
 					CertFile:              cert,
 					CertKeyFile:           key,
-					EnablePrefork:         preforkEnabled,
+					EnablePrefork:         true,
 				})
 				if err != nil {
 					log.Printf("tls listener on :8081: %v", err)
