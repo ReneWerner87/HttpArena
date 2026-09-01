@@ -152,3 +152,10 @@ request at a fixed rate, is what those profiles are for: it depends on whether t
 core each, and here they do — the harness pins the server to `0-31,64-95` and the load generator
 to the other half of the chip. `/benchmark -f fiber` reports the deltas against this entry's
 results on `main`, so the trade is a number rather than an argument.
+
+## Tuned sibling
+
+The changes this entry does not make because standard mode does not allow them — sonic behind
+`c.JSON`, the compress middleware at its best-speed level, the Postgres pool opened to full size
+at startup — live in the [`fiber-tuned`](../fiber-tuned/) entry, `mode: tuned`. Same server
+otherwise; the board runs both, so each change is a delta against this entry rather than a claim.

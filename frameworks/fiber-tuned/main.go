@@ -1,19 +1,26 @@
+// fiber-tuned is the fiber entry with the three changes tuned mode allows and
+// standard mode does not: sonic in place of encoding/json, the compress
+// middleware at its best-speed level, and the Postgres pool opened to its full
+// size at startup rather than lazily. Everything else - the routes, prefork,
+// the static and TLS paths, the shutdown - is the standard entry's, unchanged,
+// and its README explains those.
 package main
 
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/bytedance/sonic"
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/compress"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -80,8 +87,25 @@ func loadDataset() {
 		log.Printf("dataset %s: %v", path, err)
 		return
 	}
-	if err := json.Unmarshal(data, &dataset); err != nil {
+	if err := sonic.Unmarshal(data, &dataset); err != nil {
 		log.Printf("dataset %s: %v", path, err)
+	}
+}
+
+// sonic compiles an encoder per type the first time it meets it. Doing that
+// here, once per worker at startup, keeps the compile out of the first
+// requests of a run - the JIT is the point of choosing it, so pay for it
+// where nothing is being measured.
+func pretouchJSON() {
+	for _, t := range []reflect.Type{
+		reflect.TypeOf(ProcessResponse{}),
+		reflect.TypeOf(itemsResponse{}),
+		reflect.TypeOf(fiber.Map{}),
+		reflect.TypeOf(crudBody{}),
+	} {
+		if err := sonic.Pretouch(t); err != nil {
+			log.Printf("sonic pretouch %s: %v", t, err)
+		}
 	}
 }
 
@@ -167,9 +191,10 @@ const itemColumns = "id, name, category, price, quantity, active, tags, rating_s
 // the TTL is kept at what the workload they were built for needed.
 const crudTTL = 200 * time.Millisecond
 
-// The pool is sized from DATABASE_MAX_CONN and from nothing else, which is what
-// the async-db profile requires of a standard entry: "Size the pool from
-// DATABASE_MAX_CONN (currently 256), not from CPU count."
+// The pool is sized from DATABASE_MAX_CONN, as in the standard entry. Tuned
+// mode allows "custom pool sizes", but the number is the server's, not this
+// entry's: a pool larger than what Postgres accepts is a pool that fails to
+// fill, and a smaller one gives connections away.
 //
 // The 8 subtracted below is a safety margin rather than an exact figure: the
 // server keeps 3 connections back for the superuser by default, and the
@@ -177,6 +202,11 @@ const crudTTL = 200 * time.Millisecond
 // is divided by the worker count because the budget belongs to the container,
 // not to a process, and every child opens a pool of its own against the same
 // server - undivided, the fleet would ask for sixty-four times what it can get.
+//
+// What is tuned is when the connections are opened. pgxpool opens them lazily,
+// so in the standard entry the first requests of a run pay for a TCP connect
+// and a Postgres handshake each. MinConns set to the pool size has the pool
+// open them at startup instead, in a goroutine, before load arrives.
 func loadPgPool() {
 	url := os.Getenv("DATABASE_URL")
 	if url == "" {
@@ -199,6 +229,7 @@ func loadPgPool() {
 		maxConns = 1
 	}
 	cfg.MaxConns = int32(maxConns)
+	cfg.MinConns = int32(maxConns)
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
 		log.Printf("database pool: %v", err)
@@ -236,7 +267,7 @@ func queryItems(ctx context.Context, sql string, args ...any) ([]DatasetItem, er
 			return nil, err
 		}
 		if len(tags) > 0 {
-			if err := json.Unmarshal(tags, &it.Tags); err != nil {
+			if err := sonic.Unmarshal(tags, &it.Tags); err != nil {
 				return nil, err
 			}
 		}
@@ -344,7 +375,7 @@ func crudCreate(c fiber.Ctx) error {
 		return c.Status(500).JSON(fiber.Map{"error": "DB not available"})
 	}
 	var b crudBody
-	if err := json.Unmarshal(c.Body(), &b); err != nil {
+	if err := sonic.Unmarshal(c.Body(), &b); err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": "insert failed"})
 	}
 	if b.Name == "" {
@@ -401,7 +432,7 @@ func crudRead(c fiber.Ctx) error {
 	if len(items) == 0 {
 		return c.SendStatus(404)
 	}
-	body, _ := json.Marshal(items[0])
+	body, _ := sonic.Marshal(items[0])
 	if rdb != nil {
 		rdb.Set(ctx, key, body, crudTTL)
 	}
@@ -419,7 +450,7 @@ func crudUpdate(c fiber.Ctx) error {
 		return c.SendStatus(fiber.StatusNotFound)
 	}
 	var b crudBody
-	if err := json.Unmarshal(c.Body(), &b); err != nil {
+	if err := sonic.Unmarshal(c.Body(), &b); err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": "update failed"})
 	}
 	if b.Name == "" {
@@ -527,23 +558,35 @@ func main() {
 		loadDataset()
 		loadPgPool()
 		loadRedis()
+		pretouchJSON()
 	}
 
-	// No fiber.Config: nothing here needs a setting the framework does not
-	// already default to. The body limit in particular used to be raised to
-	// 25 MB for an upload profile that no longer exists - the default 4 MB is
-	// forty times the largest body anything now sends this entry, the 100 KB
-	// the 8gbit validation posts.
-	app := fiber.New()
+	// The one Config the standard entry does without. sonic replaces
+	// encoding/json behind c.JSON - tuned mode names alternative serializers
+	// first among what it allows - and it is the JIT build, not the compat
+	// one: on amd64 and arm64 sonic's build tags select it for every Go from
+	// 1.17 up to, not including, 1.28. Its output for these types is the same
+	// bytes encoding/json writes; the one default that differs, HTML escaping,
+	// has nothing to act on in the dataset. Everything else in Config stays at
+	// the framework's default, the 4 MB body limit included.
+	app := fiber.New(fiber.Config{
+		JSONEncoder: sonic.Marshal,
+		JSONDecoder: sonic.Unmarshal,
+	})
 
 	// Compression is mounted on the two routes with a body worth compressing
-	// rather than on the whole app. What that leaves out is either answered in
-	// a handful of bytes - /pipeline, /baseline11, /delay and /baseline2, where
-	// fasthttp's 200-byte floor means the middleware could only walk the chain
-	// and stamp a Vary header on the endpoints baseline, latency-1m and
-	// latency-10k drive - or wanted back unchanged, which is /echo. /async-db
-	// and /crud are outside it too, and their callers send no Accept-Encoding.
-	app.Use([]string{"/json", "/static"}, compress.New())
+	// rather than on the whole app, as in the standard entry. The level is
+	// what differs: best speed rather than the default. json-comp scores
+	// requests per second for a body that is serialized and compressed per
+	// request, and the profile requires valid gzip or brotli, not a ratio -
+	// the compress middleware picks brotli for the profile's "gzip, br", so
+	// this is brotli at its fastest setting, gzip at level 1 for a client
+	// that accepts only gzip. Static is unaffected either way: the twins on
+	// disk are compressed already, and the middleware leaves an encoded body
+	// alone.
+	app.Use([]string{"/json", "/static"}, compress.New(compress.Config{
+		Level: compress.LevelBestSpeed,
+	}))
 
 	app.Get("/pipeline", pipeline)
 	app.Get("/baseline11", baseline11)
