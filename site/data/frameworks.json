@@ -518,9 +518,23 @@
     "type": "engine",
     "engine": "libuv"
   },
+  "fiber-prefork": {
+    "dir": "fiber-prefork",
+    "description": "The fiber entry's source with prefork switched on: fasthttp forks one child process per core, each accepting on its own SO_REUSEPORT socket with GOMAXPROCS(1), on 8080 and on the TLS listener alike. Tuned rather than standard because prefork is off by default in Fiber and a worker count past the framework default is what standard mode excludes. Nothing else differs from the standard entry - same handlers, same middleware, same version - so the gap between the two rows is the process model and the price of running one Go runtime per core instead of one across all of them. The Postgres pool is divided by the child count, since DATABASE_MAX_CONN is a budget for the container rather than for a process.",
+    "repo": "https://github.com/gofiber/fiber",
+    "type": "flagship",
+    "engine": "fasthttp",
+    "mode": "tuned",
+    "completeness": {
+      "routing": true,
+      "middleware": true,
+      "request": true,
+      "response": true
+    }
+  },
   "fiber": {
     "dir": "fiber",
-    "description": "Fiber 3 on fasthttp, default configuration. Routing and path/query binding through the Fiber API, JSON via c.JSON, gzip through the Fiber compress middleware.",
+    "description": "Fiber 3 on fasthttp, default configuration - one process, no prefork. Routing and typed path/query binding through the Fiber API, JSON via c.JSON, gzip and brotli through the Fiber compress middleware. Static files are read from disk per request, taking the pre-compressed .br/.gz twin the harness ships beside each file when the client accepts one. SIGTERM drains through ListenConfig.GracefulContext. The fiber-prefork entry is the same source with prefork switched on.",
     "repo": "https://github.com/gofiber/fiber",
     "type": "flagship",
     "engine": "fasthttp",

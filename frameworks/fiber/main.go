@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -17,6 +20,26 @@ import (
 )
 
 const maxBody = 25 * 1024 * 1024
+
+// Prefork is decided at image build time: the Dockerfile takes FIBER_PREFORK as
+// a build argument and the fiber-prefork entry builds this same source with it
+// set to 1. One child process per core is a worker count past the framework
+// default, which standard mode does not allow, so the switch stays off here and
+// the tuned sibling is the entry that turns it on.
+var preforkEnabled = os.Getenv("FIBER_PREFORK") == "1"
+
+// preforkWorkers is how many processes end up sharing anything the container
+// holds once - the connection budget below, most of all. fasthttp forks
+// GOMAXPROCS children, read in the master before it spawns anything; a child
+// re-runs main() from the top and reads the same value here, because the
+// GOMAXPROCS(1) that prefork applies to a child happens later, when it takes
+// its listener.
+func preforkWorkers() int {
+	if !preforkEnabled {
+		return 1
+	}
+	return runtime.GOMAXPROCS(0)
+}
 
 type Rating struct {
 	Score int `json:"score"`
@@ -62,13 +85,13 @@ func pipeline(c fiber.Ctx) error {
 	return c.SendString("ok")
 }
 
+// The profile sends a and b and nothing else, so they are read by name through
+// Fiber's typed query binder rather than materialising the whole query string
+// into a map. Both are hot: baseline drives this endpoint at 4096 connections
+// and the two fixed-rate profiles score what a request costs in CPU, where one
+// map allocation per request is a line item.
 func baseline11(c fiber.Ctx) error {
-	sum := 0
-	for _, v := range c.Queries() {
-		if n, err := strconv.Atoi(v); err == nil {
-			sum += n
-		}
-	}
+	sum := fiber.Query[int](c, "a") + fiber.Query[int](c, "b")
 	if c.Method() == fiber.MethodPost {
 		if n, err := strconv.Atoi(strings.TrimSpace(string(c.Body()))); err == nil {
 			sum += n
@@ -77,16 +100,30 @@ func baseline11(c fiber.Ctx) error {
 	return c.SendString(strconv.Itoa(sum))
 }
 
+// GET /delay/{ms}: answer no earlier than the wait named in the path. A
+// goroutine parked on a timer is what Fiber gives you for free here - the
+// handler blocks, the process does not.
+func delay(c fiber.Ctx) error {
+	ms := fiber.Params[int](c, "ms", -1)
+	if ms < 0 {
+		return c.SendStatus(fiber.StatusNotFound)
+	}
+	if ms > 0 {
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+	}
+	return c.SendString(strconv.Itoa(ms))
+}
+
 func jsonItems(c fiber.Ctx) error {
-	count, _ := strconv.Atoi(c.Params("count"))
+	count := fiber.Params[int](c, "count", 0)
 	if count < 0 {
 		count = 0
 	}
 	if count > len(dataset) {
 		count = len(dataset)
 	}
-	m, err := strconv.Atoi(c.Query("m"))
-	if err != nil || m == 0 {
+	m := fiber.Query[int](c, "m", 1)
+	if m == 0 {
 		m = 1
 	}
 
@@ -114,8 +151,11 @@ const itemColumns = "id, name, category, price, quantity, active, tags, rating_s
 // from a copy the writes have already moved past.
 const crudTTL = 200 * time.Millisecond
 
-// One process here, so the whole connection budget is ours - but Postgres runs
-// with max_connections=256 and reserves a few of those for the superuser.
+// Postgres runs with max_connections=256 and reserves a few of those for the
+// superuser, so the entry's share is the budget less that headroom. Under
+// prefork the share is divided again: every child process opens a pool of its
+// own against the same server, and a pool sized for one process would have the
+// fleet asking for sixty-four times what the server will hand out.
 func loadPgPool() {
 	url := os.Getenv("DATABASE_URL")
 	if url == "" {
@@ -131,8 +171,9 @@ func loadPgPool() {
 			budget = n
 		}
 	}
-	maxConns := budget - 8
-	if m := runtime.NumCPU() * 4; m < maxConns {
+	workers := preforkWorkers()
+	maxConns := (budget - 8) / workers
+	if m := runtime.NumCPU() * 4 / workers; m < maxConns {
 		maxConns = m
 	}
 	if maxConns < 1 {
@@ -179,6 +220,13 @@ func queryItems(ctx context.Context, sql string, args ...any) ([]DatasetItem, er
 		}
 		items = append(items, it)
 	}
+	// A connection that fails mid-iteration ends the loop like a clean finish
+	// does. Without this the handler would answer 200 with however many rows
+	// arrived before the error, which reads as a short result rather than a
+	// failed one.
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return items, nil
 }
 
@@ -201,19 +249,41 @@ func clamp(v, lo, hi int) int {
 	return v
 }
 
-var emptyItems = fiber.Map{"items": []DatasetItem{}, "count": 0}
+// The async-db response is a struct rather than a fiber.Map: same JSON, without
+// asking encoding/json to reflect over a map and sort its keys per request.
+type itemsResponse struct {
+	Items []DatasetItem `json:"items"`
+	Count int           `json:"count"`
+}
+
+var emptyItems = itemsResponse{Items: []DatasetItem{}}
+
+// Every database and cache call is answered inside this deadline.
+//
+// Fiber's Ctx.Context() is a background context unless the application puts one
+// there, and fasthttp has no per-request cancellation to put there either - a
+// client that walks away mid-query leaves the query running and its pool
+// connection held. A deadline is what bounds that, and it is what the net/http
+// entries get from the request context for free.
+const dbTimeout = 5 * time.Second
+
+func dbContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), dbTimeout)
+}
 
 func asyncDb(c fiber.Ctx) error {
 	if pgPool == nil {
 		return c.JSON(emptyItems)
 	}
-	items, err := queryItems(c.Context(),
+	ctx, cancel := dbContext()
+	defer cancel()
+	items, err := queryItems(ctx,
 		"SELECT "+itemColumns+" FROM items WHERE price BETWEEN $1 AND $2 LIMIT $3",
 		queryInt(c, "min", 10), queryInt(c, "max", 50), clamp(queryInt(c, "limit", 50), 1, 50))
 	if err != nil {
 		return c.JSON(emptyItems)
 	}
-	return c.JSON(fiber.Map{"items": items, "count": len(items)})
+	return c.JSON(itemsResponse{Items: items, Count: len(items)})
 }
 
 func crudList(c fiber.Ctx) error {
@@ -229,7 +299,9 @@ func crudList(c fiber.Ctx) error {
 		page = 1
 	}
 	limit := clamp(queryInt(c, "limit", 10), 1, 50)
-	items, err := queryItems(c.Context(),
+	ctx, cancel := dbContext()
+	defer cancel()
+	items, err := queryItems(ctx,
 		"SELECT "+itemColumns+" FROM items WHERE category = $1 ORDER BY id LIMIT $2 OFFSET $3",
 		category, limit, (page-1)*limit)
 	if err != nil {
@@ -260,8 +332,10 @@ func crudCreate(c fiber.Ctx) error {
 	if b.Category == "" {
 		b.Category = "test"
 	}
+	ctx, cancel := dbContext()
+	defer cancel()
 	var id int
-	err := pgPool.QueryRow(c.Context(),
+	err := pgPool.QueryRow(ctx,
 		`INSERT INTO items (id, name, category, price, quantity, active, tags, rating_score, rating_count)
 		 VALUES ($1, $2, $3, $4, $5, true, '["bench"]', 0, 0)
 		 ON CONFLICT (id) DO UPDATE SET name = $2, price = $4, quantity = $5 RETURNING id`,
@@ -283,7 +357,8 @@ func crudRead(c fiber.Ctx) error {
 	if err != nil {
 		return c.SendStatus(404)
 	}
-	ctx := c.Context()
+	ctx, cancel := dbContext()
+	defer cancel()
 	key := "crud:" + strconv.Itoa(id)
 	if rdb != nil {
 		if hit, err := rdb.Get(ctx, key).Result(); err == nil && hit != "" {
@@ -323,7 +398,8 @@ func crudUpdate(c fiber.Ctx) error {
 	if b.Name == "" {
 		b.Name = "Updated"
 	}
-	ctx := c.Context()
+	ctx, cancel := dbContext()
+	defer cancel()
 	tag, err := pgPool.Exec(ctx,
 		"UPDATE items SET name = $1, price = $2, quantity = $3 WHERE id = $4",
 		b.Name, b.Price, b.Quantity, id)
@@ -346,34 +422,95 @@ var mimeTypes = map[string]string{
 }
 
 // Static bodies are read from disk on every request, which the static profiles
-// require in every mode. Standard mode leaves the encoding to the compress
-// middleware mounted above rather than serving a pre-compressed sibling.
+// require in every mode - nothing here holds a copy, so a file replaced on disk
+// is served from its next request onwards.
+//
+// Fiber's own static middleware is not an option for either half of that.
+// Its cache holds open file handles and never re-stats them, so a file replaced
+// on disk keeps being served for up to CacheDuration - which is the one thing
+// the profile checks. And its Compress option generates .fiber.br twins next to
+// the originals rather than reading the .br/.gz ones already there, on a
+// directory the harness mounts read-only.
+//
+// So the twins are picked up here. The profile allows selecting them off
+// Accept-Encoding where a framework has no API of its own for it; those bytes
+// exist on disk either way, which makes this a file read rather than
+// compression. It is also the difference between answering the 20-file rotation
+// with 842 KB and with 219 KB, because the compress middleware sits this round
+// out: fasthttp's Accept-Encoding matcher compares whole tokens, and the profile
+// sends "br;q=1, gzip;q=0.8".
 func staticFile(c fiber.Ctx) error {
 	name := c.Params("filename")
 	if name == "" || strings.Contains(name, "/") || strings.Contains(name, "..") {
-		return c.SendStatus(404)
+		return c.SendStatus(fiber.StatusNotFound)
 	}
-	data, err := os.ReadFile("/data/static/" + name)
-	if err != nil {
-		return c.SendStatus(404)
+	path := "/data/static/" + name
+
+	var data []byte
+	enc := ""
+	// Fiber's own negotiation reads the q-values the way RFC 9110 says, which
+	// is the whole difficulty here. It is guarded on the header being present
+	// because with no Accept-Encoding at all a negotiator answers with the
+	// first offer, and that would encode a body for a client that never asked.
+	if c.Get(fiber.HeaderAcceptEncoding) != "" {
+		switch c.AcceptsEncodings("br", "gzip") {
+		case "br":
+			if b, err := os.ReadFile(path + ".br"); err == nil {
+				data, enc = b, "br"
+			}
+		case "gzip":
+			if b, err := os.ReadFile(path + ".gz"); err == nil {
+				data, enc = b, "gzip"
+			}
+		}
 	}
+	if enc == "" {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return c.SendStatus(fiber.StatusNotFound)
+		}
+		data = b
+	}
+
+	// The Content-Type is the original file's either way; only the encoding
+	// changes. Set before Send so the compress middleware sees a body that is
+	// already encoded and leaves it alone.
 	ct := mimeTypes[filepath.Ext(name)]
 	if ct == "" {
 		ct = "application/octet-stream"
 	}
-	c.Set("Content-Type", ct)
+	c.Set(fiber.HeaderContentType, ct)
+	if enc != "" {
+		c.Set(fiber.HeaderContentEncoding, enc)
+		c.Set(fiber.HeaderVary, fiber.HeaderAcceptEncoding)
+	}
 	return c.Send(data)
 }
 
 func main() {
-	loadDataset()
-	loadPgPool()
-	loadRedis()
+	// Under prefork the master process supervises children and nothing else: it
+	// binds no socket and serves no request, so the dataset, the pool and the
+	// cache client belong in the children. Each of those re-runs main() from
+	// the top with the marker environment variable set, which is what
+	// fiber.IsChild reads.
+	serving := !preforkEnabled || fiber.IsChild()
+	if serving {
+		loadDataset()
+		loadPgPool()
+		loadRedis()
+	}
 
 	app := fiber.New(fiber.Config{
 		BodyLimit: maxBody,
 	})
-	app.Use(compress.New())
+
+	// Compression is mounted on the two routes with a body worth compressing
+	// rather than on the whole app. Mounted globally it also runs on /pipeline
+	// and /baseline11, whose bodies are a handful of bytes: fasthttp will not
+	// compress anything under 200 bytes anyway, so all the middleware does
+	// there is walk the chain and stamp a Vary header onto the response - on
+	// the endpoint the baseline and the two CPU-per-request profiles drive.
+	app.Use([]string{"/json", "/static"}, compress.New())
 
 	app.Get("/pipeline", pipeline)
 	app.Get("/baseline11", baseline11)
@@ -381,6 +518,7 @@ func main() {
 	app.Get("/json/:count", jsonItems)
 	app.Post("/echo", echoBody)
 	app.Get("/baseline2", baseline11)
+	app.Get("/delay/:ms", delay)
 	app.Get("/static/:filename", staticFile)
 	app.Get("/async-db", asyncDb)
 	app.Get("/crud/items", crudList)
@@ -388,18 +526,50 @@ func main() {
 	app.Get("/crud/items/:id", crudRead)
 	app.Put("/crud/items/:id", crudUpdate)
 
-	// json-tls and static-tls on 8081, the same app behind TLS. The harness only
-	// mounts /certs for the TLS profiles, so without them it is not opened.
-	const cert, key = "/certs/server.crt", "/certs/server.key"
-	if _, err := os.Stat(cert); err == nil {
-		if _, err := os.Stat(key); err == nil {
-			go app.Listen(":8081", fiber.ListenConfig{
-				DisableStartupMessage: true,
-				CertFile:              cert,
-				CertKeyFile:           key,
-			})
+	listen := fiber.ListenConfig{
+		DisableStartupMessage: true,
+		EnablePrefork:         preforkEnabled,
+	}
+
+	if serving {
+		// SIGTERM is what `docker stop` sends between profiles, and draining
+		// beats being cut off mid-response. It is deliberately not installed in
+		// the prefork master: that process serves nothing, and taking the
+		// signal over from the runtime there would keep it alive until Docker
+		// gave up waiting and escalated to SIGKILL.
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		listen.GracefulContext = ctx
+
+		// json-tls, static-tls and 8gbit on 8081, the same app behind TLS. The
+		// harness mounts /certs for every run, so the files being there is what
+		// says the listener is wanted.
+		const cert, key = "/certs/server.crt", "/certs/server.key"
+		_, certErr := os.Stat(cert)
+		_, keyErr := os.Stat(key)
+		if certErr == nil && keyErr == nil {
+			go func() {
+				// In a child, EnablePrefork means "take the SO_REUSEPORT socket
+				// for this address", not "fork again": fasthttp checks the
+				// child marker before it looks at anything else. Without it all
+				// N children would race for an ordinary bind on 8081 and every
+				// one but the winner would fail - silently, before this
+				// returned the error rather than dropping it.
+				err := app.Listen(":8081", fiber.ListenConfig{
+					DisableStartupMessage: true,
+					CertFile:              cert,
+					CertKeyFile:           key,
+					EnablePrefork:         preforkEnabled,
+				})
+				if err != nil {
+					log.Printf("tls listener on :8081: %v", err)
+				}
+			}()
 		}
 	}
 
-	app.Listen(":8080", fiber.ListenConfig{DisableStartupMessage: true})
+	if err := app.Listen(":8080", listen); err != nil {
+		log.Printf("listener on :8080: %v", err)
+		os.Exit(1)
+	}
 }
