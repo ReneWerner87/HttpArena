@@ -134,7 +134,9 @@ reclassifies 37 entries, `go-fasthttp` and `axum` among them, not this one alone
   one that matters: `DATABASE_MAX_CONN` is a budget for the container, not for a process.
 
 What it costs is one Go runtime per hardware thread — N heaps, N garbage collectors, N sets of
-background threads — paid for whether or not requests are arriving, and visible in the memory
-figure as much as in `latency-1m` and `latency-10k`, the two profiles that price exactly that.
-`/benchmark -f fiber` reports the deltas against this entry's results on `main`, so the trade
-is a number rather than an argument.
+background threads — paid for whether or not requests are arriving. The memory figure carries
+that directly. Whether it also lands on `latency-1m` and `latency-10k`, which price CPU per
+request at a fixed rate, is what those profiles are for: it depends on whether the workers get a
+core each, and here they do — the harness pins the server to `0-31,64-95` and the load generator
+to the other half of the chip. `/benchmark -f fiber` reports the deltas against this entry's
+results on `main`, so the trade is a number rather than an argument.
