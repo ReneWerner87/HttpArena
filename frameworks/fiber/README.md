@@ -4,7 +4,7 @@ Fiber web framework on fasthttp, with prefork for multi-core scaling.
 
 ## Stack
 
-- **Language:** Go 1.26
+- **Language:** Go — `go 1.25.0` in go.mod, built with the 1.26 toolchain
 - **Framework:** Fiber 3
 - **Build:** `golang:1.26-alpine` -> `alpine:3.23` runtime
 
@@ -14,83 +14,99 @@ Fiber web framework on fasthttp, with prefork for multi-core scaling.
 |----------|--------|-------------|
 | `/pipeline` | GET | Returns `ok` (plain text) |
 | `/baseline11` | GET | Sums the `a` and `b` query parameters |
-| `/baseline11` | POST | Sums the query parameters + request body |
+| `/baseline11` | POST | Sums the query parameters + the request body |
+| `/baseline2` | GET | The same handler under the name the HTTP/2 profiles use. Kept for parity with the other Go entries; fasthttp speaks no HTTP/2, so nothing here drives it |
 | `/json/{count}?m=N` | GET | First `count` dataset items with `total = price * quantity * m` |
-| `/echo` | POST | Returns the request body back verbatim |
-| `/delay/{ms}` | GET | Answers with `ms` after waiting that long |
-| `/static/{file}` | GET | Serves `/data/static`, pre-compressed variant where the client takes one |
+| `/echo` | POST | Returns the request body verbatim. `8gbit` posts to it over TLS on 8081 |
+| `/delay/{ms}` | GET | Answers `ms` after waiting that long |
+| `/static/{file}` | GET | Serves `/data/static`, pre-compressed twin where the client takes one |
+| `/async-db` | GET | Items in a price range from Postgres (`min`, `max`, `limit`) |
+| `/crud/items` | GET, POST | List by category; upsert by id |
+| `/crud/items/{id}` | GET, PUT | Read through the cache; update and invalidate |
 
 ## Notes
 
-- Routing and path/query access through the Fiber API: `fiber.Params[int]` and
-  `fiber.Query[int]` read the two operands `/baseline11` is given by name, so the
-  hot path does not build a map of the query string per request
-- JSON through `c.JSON`, serialized per request
-- Compression through the Fiber `compress` middleware, mounted on `/json` and `/static` rather
-  than globally: on the few-byte bodies of `/pipeline` and `/baseline11` it can only add a `Vary`
-  header, and those are the endpoints the throughput and CPU-per-request profiles drive
-- Body limit raised to 25 MB so the in-out profile is not rejected
-- A worker signalled directly drains through `ListenConfig.GracefulContext` rather than being
-  cut off mid-response. `docker stop` signals PID 1 — the prefork master — which holds no
-  handler of its own on purpose, so it exits and the workers follow it out within one 500 ms
-  parent-pid poll
+- **No `fiber.Config`.** The app is built with `fiber.New()`, so every setting is the
+  framework's own default — the 4 MB body limit included, which is forty times the largest
+  body anything sends this entry (100 KB, in the `8gbit` validation).
+- Routing and binding through the Fiber API: `/baseline11` reads its two operands with
+  `fiber.Query[int]`, `/json/{count}`, `/delay/{ms}` and `/crud/items/{id}` read their path
+  parameter with `fiber.Params[int]`, and `/async-db` and `/crud/items` read theirs with
+  `fiber.Query[int]` as well. No request materialises the query string into a map.
+- JSON through `c.JSON`, serialized per request.
+- The `compress` middleware is mounted on `/json` and `/static` rather than on the whole app.
+  What that leaves out is either answered in a handful of bytes — `/pipeline`, `/baseline11`,
+  `/delay/{ms}`, `/baseline2`, where fasthttp's 200-byte floor means the middleware could only
+  stamp a `Vary` header on the endpoints the throughput and CPU-per-request profiles drive — or
+  wanted back unchanged, which is `/echo`. `/async-db` and `/crud/*` are outside it too; their
+  profiles send no `Accept-Encoding`, so nothing would have compressed there anyway.
+- A worker that is signalled directly finishes the requests it is holding before it exits: a
+  request signalled 0.4 s into a 1.5 s handler still answers 200 at 1.5 s. `docker stop` is a
+  different path and does not drain — it signals PID 1, which here is the prefork master, and
+  when the init of a PID namespace exits the kernel takes the rest of the namespace with it.
 
 ## Added profiles
 
-`static-tls`, `json-tls`, `async` and `async-db`. The `/crud/*` routes are still served but no
-profile drives them any more; they are kept because the multi-endpoint stacks are built on that
-shape.
+`async`, `json-tls`, `static-tls` and `async-db`. The `/crud/*` routes are still served, but no
+profile drives them any more.
 
-- `json-tls` and `static-tls` listen on `8081` when `/certs/server.crt` and `/certs/server.key`
-  are mounted; it is the same router behind TLS, not a second copy of the handlers.
-- Static file bodies are read from disk on every request, which the static profiles require in
-  every mode — nothing here holds a copy, so a file replaced on disk is served from the next
-  request onwards. Fiber's own static middleware cannot do that job here: its cache holds open
-  file handles and never re-stats them, so a replaced file keeps being served for up to
-  `CacheDuration`, and its `Compress` option writes `.fiber.br` twins into a directory the
-  harness mounts read-only.
-- Where the client accepts an encoding, the `.br`/`.gz` twin the harness ships beside the file is
-  read instead of the original, chosen with Fiber's own `AcceptsEncodings` negotiation. The
-  profile allows selecting it off `Accept-Encoding` where a framework has no API of its own for
-  it, and the alternative is not compression but 842 KB of the 20-file rotation going out
-  uncompressed, because fasthttp's Accept-Encoding matcher compares whole tokens and the profile
-  sends `br;q=1, gzip;q=0.8`.
-- `/delay/{ms}` parks the handler's goroutine on a timer, which is what makes the `async`
-  profile a question about the process rather than about the handler.
-- Postgres goes through `pgx`. Every database call carries a deadline: Fiber's `Ctx.Context()`
-  is a background context and fasthttp has no per-request cancellation to put in it, so nothing
-  else would bound a query whose client has gone away.
-- `crud` runs cache-aside on Redis with a 200ms TTL and an explicit delete on update.
-- `tags` is a JSONB column, so it comes back as bytes rather than a Go slice.
+- `json-tls`, `static-tls` and `8gbit` share the listener on `8081`, opened when
+  `/certs/server.crt` and `/certs/server.key` are both present. It is the same router behind
+  TLS, not a second copy of the handlers.
+- What the static profiles require is that the response follow the disk: replace a file and the
+  next response carries the new bytes. Serving from memory is allowed in every mode, but only
+  through a cache that is the framework's own — and Fiber's static middleware cannot be that
+  cache here, because it holds open file handles and never re-stats them, so a replaced file
+  keeps being served for up to `CacheDuration`, and its `Compress` option writes `.fiber.br`
+  twins into a directory the harness mounts read-only. So this entry reads per request and
+  holds no copy of its own.
+- Where the client accepts an encoding, the `.br`/`.gz` twin the harness ships beside the file
+  is read instead of the original, picked with Fiber's own `AcceptsEncodings`. The profile
+  allows selecting the variant off `Accept-Encoding` where a framework has no API for it, and
+  the alternative is not compression but the rotation going out at full size: the 20 files
+  weigh 1.21 MB as originals and 318 KB as the twins the client is offered, and the compress
+  middleware sits the round out because fasthttp's Accept-Encoding matcher compares whole
+  tokens while the profile sends `br;q=1, gzip;q=0.8`.
+- `/delay/{ms}` parks the handler's goroutine on a timer, which is what makes `async` a
+  question about the process rather than about the handler.
+- Postgres goes through `pgx`, and every database and cache call carries a deadline: Fiber's
+  `Ctx.Context()` is a background context and fasthttp has no per-request cancellation to put
+  in it, so nothing else would bound a query whose client has gone away.
+- The crud read is cache-aside on Redis with a 200 ms TTL and an explicit delete on update,
+  when `REDIS_URL` is set. The harness passes one only to the compose stacks, so in a
+  single-container run this reads straight through to Postgres.
+- `tags` is a JSONB column, so it arrives as bytes rather than as a Go slice.
 
 ## Prefork
 
-`app.Listen(":8080", fiber.ListenConfig{EnablePrefork: true})` hands off to
-fasthttp's prefork manager, which is Fiber's answer to the same problem Node's
-`cluster` module solves for the `express`, `fastify` and `koa` entries and
-`SO_REUSEPORT` forking solves for `aiohttp`: one worker per core, which is the
-worker count the implementation rules permit an entry to match.
+`app.Listen(":8080", fiber.ListenConfig{EnablePrefork: true})` hands off to fasthttp's prefork
+manager: one worker process per CPU the container is given. Standard mode allows an entry to
+match its worker count to the hardware — "Worker/thread counts matching available CPU cores" —
+and it is the same thing Node's `cluster` module does for the `express`, `fastify` and `koa`
+entries, and what `aiohttp` describes as "one forked worker per core sharing the port with
+SO_REUSEPORT".
 
-- The master process binds nothing. It re-executes the binary `GOMAXPROCS` times
-  with `FASTHTTP_PREFORK_CHILD=1` set and then supervises, restarting a child
-  that dies. Children notice a dead master by their parent pid changing and exit.
-- Each child calls `reuseport.Listen` for itself and sets `GOMAXPROCS(1)`, so the
-  container runs one Go runtime per core rather than one runtime scheduling every
-  core. The kernel spreads accepted connections across the listening sockets.
-- The TLS listener on `8081` is opened the same way, once per child. In a child
-  `EnablePrefork` means "take the `SO_REUSEPORT` socket for this address", not
-  "fork again", and without it every child would race for an ordinary bind and
-  all but one would lose it — silently, before the error was logged.
-- The dataset, the Postgres pool and the Redis client are loaded only where
-  `fiber.IsChild()` is true. The master has no use for them, and a pool opened
-  before the fork would hand the same connections to every child.
-- Anything the container holds once is divided by the child count. The Postgres
-  pool is the one that matters: `DATABASE_MAX_CONN` is a budget for the
-  container, not for a process, and a pool sized for one process would have the
-  fleet asking for sixty-four times what the server will hand out.
+- The master binds nothing. It re-executes the binary `GOMAXPROCS` times with
+  `FASTHTTP_PREFORK_CHILD=1` set, then supervises: a worker that dies is replaced, until the
+  cumulative number of exits passes `PreforkRecoverThreshold` (Fiber defaults it to
+  `GOMAXPROCS/2`), at which point the master gives up and the container exits with it.
+- On the benchmark cpuset (`0-31,64-95` — 32 physical cores, 64 hardware threads) that is 64
+  workers, each dropped to `GOMAXPROCS(1)` by prefork itself: one Go runtime per hardware
+  thread rather than one runtime scheduling all of them.
+- Each worker binds its own socket through `reuseport.Listen` and the kernel spreads accepted
+  connections across them. That listener also carries `TCP_DEFER_ACCEPT` and `TCP_FASTOPEN`,
+  which are fasthttp's defaults for a reuseport socket rather than anything this entry sets.
+- The TLS listener on `8081` is opened the same way, once per worker: in a child
+  `EnablePrefork` means "take the `SO_REUSEPORT` socket for this address", not "fork again".
+  Without it every worker would race for an ordinary bind and all but one would lose it.
+- The dataset, the Postgres pool and the Redis client are loaded only where `fiber.IsChild()`
+  is true. The master has no use for them, and a pool opened before the fork would hand the
+  same connections to every worker.
+- Anything the container holds once is divided by the worker count. The Postgres pool is the
+  one that matters: `DATABASE_MAX_CONN` is a budget for the container, not for a process.
 
-What it costs is one Go runtime per core — N heaps, N garbage collectors, N sets
-of background threads — paid for whether or not requests are arriving, which is
-what the two fixed-rate profiles measure. `/benchmark -f fiber` reports the
-deltas against this entry's results on `main`, so that trade is a number rather
-than an argument.
+What it costs is one Go runtime per hardware thread — N heaps, N garbage collectors, N sets of
+background threads — paid for whether or not requests are arriving, and visible in the memory
+figure as much as in `latency-1m` and `latency-10k`, the two profiles that price exactly that.
+`/benchmark -f fiber` reports the deltas against this entry's results on `main`, so the trade
+is a number rather than an argument.

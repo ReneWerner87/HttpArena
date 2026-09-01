@@ -19,7 +19,13 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const maxBody = 25 * 1024 * 1024
+// How long a worker keeps serving after it is signalled, before it stops
+// waiting for the requests still in flight.
+const shutdownGrace = 3 * time.Second
+
+// Closed once the shutdown started by a signal has finished, so main can wait
+// for it. Nil when this process is not serving.
+var drained chan struct{}
 
 // workerProcesses is how many processes end up sharing anything the container
 // holds once - the connection budget below, most of all.
@@ -97,12 +103,19 @@ func baseline11(c fiber.Ctx) error {
 	return c.SendString(strconv.Itoa(sum))
 }
 
+// The longest wait this will serve. The profile asks for 10ms and validation
+// for at most half a second; the cap is here because time.Duration(ms) *
+// time.Millisecond overflows int64 somewhere past a hundred million days, and
+// an overflowed duration answers immediately - the one answer this endpoint is
+// not allowed to give.
+const maxDelayMillis = int(time.Hour / time.Millisecond)
+
 // GET /delay/{ms}: answer no earlier than the wait named in the path. A
 // goroutine parked on a timer is what Fiber gives you for free here - the
 // handler blocks, the process does not.
 func delay(c fiber.Ctx) error {
 	ms := fiber.Params[int](c, "ms", -1)
-	if ms < 0 {
+	if ms < 0 || ms > maxDelayMillis {
 		return c.SendStatus(fiber.StatusNotFound)
 	}
 	if ms > 0 {
@@ -144,15 +157,21 @@ var rdb *redis.Client
 
 const itemColumns = "id, name, category, price, quantity, active, tags, rating_score, rating_count"
 
-// The crud profile reads and writes the same ids, so a long TTL would answer
-// from a copy the writes have already moved past.
+// The crud routes read and write the same ids, so a long TTL would answer from
+// a copy the writes have already moved past. No profile drives them any more;
+// the TTL is kept at what the workload they were built for needed.
 const crudTTL = 200 * time.Millisecond
 
-// Postgres runs with max_connections=256 and reserves a few of those for the
-// superuser, so the entry's share is the budget less that headroom. Under
-// prefork the share is divided again: every child process opens a pool of its
-// own against the same server, and a pool sized for one process would have the
-// fleet asking for sixty-four times what the server will hand out.
+// The pool is sized from DATABASE_MAX_CONN and from nothing else, which is what
+// the async-db profile requires of a standard entry: "Size the pool from
+// DATABASE_MAX_CONN (currently 256), not from CPU count."
+//
+// The 8 subtracted below is a safety margin rather than an exact figure: the
+// server keeps 3 connections back for the superuser by default, and the
+// harness's own psql and pg_isready probes want one now and then. The remainder
+// is divided by the worker count because the budget belongs to the container,
+// not to a process, and every child opens a pool of its own against the same
+// server - undivided, the fleet would ask for sixty-four times what it can get.
 func loadPgPool() {
 	url := os.Getenv("DATABASE_URL")
 	if url == "" {
@@ -171,9 +190,6 @@ func loadPgPool() {
 	}
 	workers := workerProcesses()
 	maxConns := (budget - 8) / workers
-	if m := runtime.NumCPU() * 4 / workers; m < maxConns {
-		maxConns = m
-	}
 	if maxConns < 1 {
 		maxConns = 1
 	}
@@ -193,6 +209,7 @@ func loadRedis() {
 	}
 	opt, err := redis.ParseURL(url)
 	if err != nil {
+		log.Printf("redis url: %v", err)
 		return
 	}
 	rdb = redis.NewClient(opt)
@@ -213,7 +230,11 @@ func queryItems(ctx context.Context, sql string, args ...any) ([]DatasetItem, er
 			&it.Active, &tags, &it.Rating.Score, &it.Rating.Count); err != nil {
 			return nil, err
 		}
-		json.Unmarshal(tags, &it.Tags)
+		if len(tags) > 0 {
+			if err := json.Unmarshal(tags, &it.Tags); err != nil {
+				return nil, err
+			}
+		}
 		if it.Tags == nil {
 			it.Tags = []string{}
 		}
@@ -227,15 +248,6 @@ func queryItems(ctx context.Context, sql string, args ...any) ([]DatasetItem, er
 		return nil, err
 	}
 	return items, nil
-}
-
-func queryInt(c fiber.Ctx, name string, fallback int) int {
-	if v := c.Query(name); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
-	}
-	return fallback
 }
 
 func clamp(v, lo, hi int) int {
@@ -278,7 +290,12 @@ func asyncDb(c fiber.Ctx) error {
 	defer cancel()
 	items, err := queryItems(ctx,
 		"SELECT "+itemColumns+" FROM items WHERE price BETWEEN $1 AND $2 LIMIT $3",
-		queryInt(c, "min", 10), queryInt(c, "max", 50), clamp(queryInt(c, "limit", 50), 1, 50))
+		fiber.Query[int](c, "min", 10), fiber.Query[int](c, "max", 50),
+		clamp(fiber.Query[int](c, "limit", 50), 1, 50))
+	// An empty list rather than a 500: it is the shape the profile documents and
+	// what every other entry answers here. It does mean a database that is down
+	// reads the same as a price range with nothing in it - validation tells them
+	// apart, because it asserts count == limit on ranges that do have rows.
 	if err != nil {
 		return c.JSON(emptyItems)
 	}
@@ -293,11 +310,11 @@ func crudList(c fiber.Ctx) error {
 	if category == "" {
 		category = "electronics"
 	}
-	page := queryInt(c, "page", 1)
+	page := fiber.Query[int](c, "page", 1)
 	if page < 1 {
 		page = 1
 	}
-	limit := clamp(queryInt(c, "limit", 10), 1, 50)
+	limit := clamp(fiber.Query[int](c, "limit", 10), 1, 50)
 	ctx, cancel := dbContext()
 	defer cancel()
 	items, err := queryItems(ctx,
@@ -342,12 +359,18 @@ func crudCreate(c fiber.Ctx) error {
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": "insert failed"})
 	}
+	// ON CONFLICT makes this an upsert, so it can move a row a previous read
+	// already cached. Same invalidation the update path does.
+	if rdb != nil {
+		rdb.Del(ctx, "crud:"+strconv.Itoa(id))
+	}
 	return c.Status(201).JSON(fiber.Map{"id": id, "name": b.Name,
 		"category": b.Category, "price": b.Price, "quantity": b.Quantity})
 }
 
-// Cache-aside on Redis where the harness provides it - crud is the one profile
-// that does.
+// Cache-aside on Redis where a REDIS_URL is provided. Nothing in a single
+// container run provides one - the harness passes it only to the compose
+// stacks - so in practice this reads straight through to Postgres.
 func crudRead(c fiber.Ctx) error {
 	if pgPool == nil {
 		return c.Status(500).JSON(fiber.Map{"error": "DB not available"})
@@ -420,9 +443,10 @@ var mimeTypes = map[string]string{
 	".json": "application/json",
 }
 
-// Static bodies are read from disk on every request, which the static profiles
-// require in every mode - nothing here holds a copy, so a file replaced on disk
-// is served from its next request onwards.
+// What the static profiles require is that the response follow the disk:
+// replace a file and the next response carries the new bytes. Serving from
+// memory is allowed in every mode, but only through a cache that is the
+// framework's own - so this reads per request and holds no copy of its own.
 //
 // Fiber's own static middleware is not an option for either half of that.
 // Its cache holds open file handles and never re-stats them, so a file replaced
@@ -500,16 +524,20 @@ func main() {
 		loadRedis()
 	}
 
-	app := fiber.New(fiber.Config{
-		BodyLimit: maxBody,
-	})
+	// No fiber.Config: nothing here needs a setting the framework does not
+	// already default to. The body limit in particular used to be raised to
+	// 25 MB for an upload profile that no longer exists - the default 4 MB is
+	// forty times the largest body anything now sends this entry, the 100 KB
+	// the 8gbit validation posts.
+	app := fiber.New()
 
 	// Compression is mounted on the two routes with a body worth compressing
-	// rather than on the whole app. Mounted globally it also runs on /pipeline
-	// and /baseline11, whose bodies are a handful of bytes: fasthttp will not
-	// compress anything under 200 bytes anyway, so all the middleware does
-	// there is walk the chain and stamp a Vary header onto the response - on
-	// the endpoint the baseline and the two CPU-per-request profiles drive.
+	// rather than on the whole app. What that leaves out is either answered in
+	// a handful of bytes - /pipeline, /baseline11, /delay and /baseline2, where
+	// fasthttp's 200-byte floor means the middleware could only walk the chain
+	// and stamp a Vary header on the endpoints baseline, latency-1m and
+	// latency-10k drive - or wanted back unchanged, which is /echo. /async-db
+	// and /crud are outside it too, and their callers send no Accept-Encoding.
 	app.Use([]string{"/json", "/static"}, compress.New())
 
 	app.Get("/pipeline", pipeline)
@@ -531,20 +559,40 @@ func main() {
 		EnablePrefork:         true,
 	}
 
+	var signalled context.Context
 	if serving {
-		// A child signalled directly drains rather than being cut off
-		// mid-response. That is fasthttp's own teardown path, where the prefork
-		// master SIGTERMs its children and waits on them.
+		// A worker signalled directly finishes the requests it is holding
+		// before it exits. That is the path fasthttp's own prefork teardown
+		// takes: when the master stops supervising it SIGTERMs its children and
+		// waits for them.
 		//
-		// `docker stop` does not take that path: it signals PID 1, which here
-		// is the master. The master serves nothing and deliberately holds no
-		// handler of its own - taking the signal over from the runtime there
-		// would keep it alive until Docker gave up waiting and escalated to
-		// SIGKILL - so it exits, and the children follow it out within one
-		// 500ms parent-pid poll.
+		// The waiting has to happen here rather than in ListenConfig's
+		// GracefulContext, which shuts the listener down in a goroutine while
+		// Listen returns straight away - main then exits and takes the
+		// in-flight response with it. Measured: with the wait below a request
+		// signalled 0.4s into a 1.5s handler still answers 200 at 1.5s; without
+		// it the client's connection dies at 0.4s.
+		//
+		// `docker stop` is a different path and does not drain: it signals
+		// PID 1, which in this container is the prefork master. The master
+		// serves nothing and deliberately holds no handler of its own - taking
+		// the signal over from the runtime there would keep it alive until
+		// Docker gave up waiting and escalated to SIGKILL - so it exits, and
+		// the kernel kills the workers with it, PID 1 of a namespace taking the
+		// namespace with it.
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		listen.GracefulContext = ctx
+		signalled = ctx
+		drained = make(chan struct{})
+		go func() {
+			<-ctx.Done()
+			// Bounded well inside the 5s `docker stop` allows, so a handler
+			// that will not finish cannot turn teardown into a SIGKILL.
+			if err := app.ShutdownWithTimeout(shutdownGrace); err != nil {
+				log.Printf("shutdown: %v", err)
+			}
+			close(drained)
+		}()
 
 		// json-tls, static-tls and 8gbit on 8081, the same app behind TLS. The
 		// harness mounts /certs for every run, so the files being there is what
@@ -573,8 +621,18 @@ func main() {
 		}
 	}
 
-	if err := app.Listen(":8080", listen); err != nil {
-		log.Printf("listener on :8080: %v", err)
+	err := app.Listen(":8080", listen)
+
+	// Listen returns for two reasons, and they need opposite answers. After a
+	// signal it means the shutdown started, and the process has to stay up
+	// until the drain finishes. Otherwise the listener failed - or, in the
+	// master, prefork gave up replacing children - and the container should
+	// exit rather than sit there answering nothing.
+	if signalled == nil || signalled.Err() == nil {
+		if err != nil {
+			log.Printf("listener on :8080: %v", err)
+		}
 		os.Exit(1)
 	}
+	<-drained
 }
