@@ -91,7 +91,7 @@ func pipeline(c fiber.Ctx) error {
 // The profile sends a and b and nothing else, so they are read by name through
 // Fiber's typed query binder rather than materialising the whole query string
 // into a map. Both are hot: baseline drives this endpoint at 4096 connections
-// and the two fixed-rate profiles score what a request costs in CPU, where one
+// and latency-1m and latency-10k score what a request costs in CPU, where one
 // map allocation per request is a line item.
 func baseline11(c fiber.Ctx) error {
 	sum := fiber.Query[int](c, "a") + fiber.Query[int](c, "b")
@@ -105,9 +105,9 @@ func baseline11(c fiber.Ctx) error {
 
 // The longest wait this will serve. The profile asks for 10ms and validation
 // for at most half a second; the cap is here because time.Duration(ms) *
-// time.Millisecond overflows int64 somewhere past a hundred million days, and
-// an overflowed duration answers immediately - the one answer this endpoint is
-// not allowed to give.
+// time.Millisecond overflows int64 past about 292 years' worth of milliseconds,
+// and an overflowed duration is negative, so the handler answers immediately -
+// the one answer this endpoint is not allowed to give.
 const maxDelayMillis = int(time.Hour / time.Millisecond)
 
 // GET /delay/{ms}: answer no earlier than the wait named in the path. A
@@ -459,9 +459,9 @@ var mimeTypes = map[string]string{
 // Accept-Encoding where a framework has no API of its own for it; those bytes
 // exist on disk either way, which makes this a file read rather than
 // compression. It is also the difference between answering the 20-file rotation
-// with 842 KB and with 219 KB, because the compress middleware sits this round
-// out: fasthttp's Accept-Encoding matcher compares whole tokens, and the profile
-// sends "br;q=1, gzip;q=0.8".
+// with the 1.21 MB the originals weigh and the 318 KB the twins do, because the
+// compress middleware sits this round out: fasthttp's Accept-Encoding matcher
+// compares whole tokens, and the profile sends "br;q=1, gzip;q=0.8".
 func staticFile(c fiber.Ctx) error {
 	name := c.Params("filename")
 	if name == "" || strings.Contains(name, "/") || strings.Contains(name, "..") {
@@ -586,8 +586,9 @@ func main() {
 		drained = make(chan struct{})
 		go func() {
 			<-ctx.Done()
-			// Bounded well inside the 5s `docker stop` allows, so a handler
-			// that will not finish cannot turn teardown into a SIGKILL.
+			// Inside the 5s the prefork master waits for a signalled child
+			// before it kills it (PreforkShutdownGracePeriod), so a handler
+			// that will not finish cannot turn a teardown into a SIGKILL.
 			if err := app.ShutdownWithTimeout(shutdownGrace); err != nil {
 				log.Printf("shutdown: %v", err)
 			}
@@ -604,10 +605,10 @@ func main() {
 			go func() {
 				// In a child, EnablePrefork means "take the SO_REUSEPORT socket
 				// for this address", not "fork again": fasthttp checks the
-				// child marker before it looks at anything else. Without it all
-				// N children would race for an ordinary bind on 8081 and every
-				// one but the winner would fail - silently, before this
-				// returned the error rather than dropping it.
+				// child marker before it looks at anything else. Without it
+				// every worker would race for an ordinary bind on 8081 and all
+				// but one would lose it - silently, back when this dropped the
+				// error instead of logging it.
 				err := app.Listen(":8081", fiber.ListenConfig{
 					DisableStartupMessage: true,
 					CertFile:              cert,
