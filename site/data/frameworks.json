@@ -520,7 +520,7 @@
   },
   "fiber": {
     "dir": "fiber",
-    "description": "Fiber 3 on fasthttp, default configuration bar prefork: one child per logical CPU sharing the port with SO_REUSEPORT and splitting the Postgres budget, at the cost of a Go runtime per child. Routing and typed path/query binding through the Fiber API, JSON via c.JSON, gzip and brotli through the Fiber compress middleware, static files read from disk per request and served from their pre-compressed .br/.gz twin.",
+    "description": "Fiber 3 on fasthttp, default configuration, one prefork child per logical CPU sharing the port. Routing and typed path/query binding through the Fiber API, JSON via c.JSON, gzip and brotli through the Fiber compress middleware.",
     "repo": "https://github.com/gofiber/fiber",
     "type": "flagship",
     "engine": "fasthttp",
