@@ -226,14 +226,6 @@
       "response": true
     }
   },
-  "bun-websocket": {
-    "dir": "bun-websocket",
-    "description": "Bun WebSocket echo server",
-    "repo": "https://github.com/oven-sh/bun",
-    "type": "emerging",
-    "engine": "bun",
-    "mode": "tuned"
-  },
   "bun": {
     "dir": "bun",
     "description": "Bun.serve, Bun's own HTTP server, with no framework on top and one process per core sharing the port.",
@@ -246,7 +238,45 @@
       "middleware": false,
       "request": true,
       "response": true
-    }
+    },
+    "variants": [
+      {
+        "dir": "bun-http2",
+        "description": "Bun.serve with the experimental `http2: true` flag, no framework on top. Two listeners off one config: TLS on 8443 where ALPN picks h2, and cleartext on 8082 where Bun switches a connection on the HTTP/2 preface (prior-knowledge h2c). Routes, JSON shape and static handler are the plain bun entry's, so the delta against it is the protocol. One process per core sharing both ports through reusePort. Needs Bun > 1.4.0 for the server-side flag.",
+        "repo": "https://github.com/oven-sh/bun",
+        "type": "flagship",
+        "engine": "bun",
+        "mode": "standard",
+        "completeness": {
+          "routing": true,
+          "middleware": false,
+          "request": true,
+          "response": true
+        }
+      },
+      {
+        "dir": "bun-http3",
+        "description": "Bun.serve with the experimental `http3: true` flag, no framework on top: QUIC on udp/8443 next to HTTP/1.1 on tcp/8443, with Alt-Svc advertised on the TCP responses. QUIC and HTTP/3 come from Bun itself (lsquic inside uWebSockets), not from a proxy in front. Routes and static handler are the plain bun entry's, so the delta against it is the transport. One process per core, all binding udp/8443 through reusePort.",
+        "repo": "https://github.com/oven-sh/bun",
+        "type": "flagship",
+        "engine": "bun",
+        "mode": "standard",
+        "completeness": {
+          "routing": true,
+          "middleware": false,
+          "request": true,
+          "response": true
+        }
+      }
+    ]
+  },
+  "bun-websocket": {
+    "dir": "bun-websocket",
+    "description": "Bun WebSocket echo server",
+    "repo": "https://github.com/oven-sh/bun",
+    "type": "emerging",
+    "engine": "bun",
+    "mode": "tuned"
   },
   "caddy": {
     "dir": "caddy",
