@@ -520,7 +520,7 @@
   },
   "fiber": {
     "dir": "fiber",
-    "description": "Fiber 3 on fasthttp, default configuration, one prefork child per logical CPU sharing the port. Routing and typed path/query binding through the Fiber API, JSON via c.JSON, gzip and brotli through the Fiber compress middleware.",
+    "description": "Fiber 3 on fasthttp, default configuration, one prefork child per logical CPU sharing the port. Routing and typed path/query binding through the Fiber API, JSON via c.JSON, gzip and brotli through the compress middleware, static files from the pre-compressed .br/.gz siblings on disk.",
     "repo": "https://github.com/gofiber/fiber",
     "type": "flagship",
     "engine": "fasthttp",
