@@ -26,13 +26,18 @@ Fiber web framework on fasthttp, with prefork for multi-core scaling.
 
 ## Notes
 
-- **No `fiber.Config`.** The app is built with `fiber.New()`, so every setting is the
-  framework's own default — the 4 MB body limit included, which is forty times the largest
-  body anything sends this entry (100 KB, in the `8gbit` validation).
+- **No `fiber.Config`.** The app is built with `fiber.New()`, so every setting the App itself
+  takes is the framework's own default — the 4 MB body limit included, which is forty times the
+  largest body anything sends this entry (100 KB, in the `8gbit` validation). What is not
+  default is in `ListenConfig`: `EnablePrefork` (the section below) and `DisableStartupMessage`,
+  which only silences a banner.
 - Routing and binding through the Fiber API: `/baseline11` reads its two operands with
   `fiber.Query[int]`, `/json/{count}`, `/delay/{ms}` and `/crud/items/{id}` read their path
   parameter with `fiber.Params[int]`, and `/async-db` and `/crud/items` read theirs with
   `fiber.Query[int]` as well. No request materialises the query string into a map.
+- One worker process per CPU the container is given, through Fiber's `EnablePrefork`: the
+  master binds nothing and every worker accepts on its own `SO_REUSEPORT` socket. The section
+  below has the mechanics and what it costs.
 - JSON through `c.JSON`, serialized per request.
 - The `compress` middleware is mounted on `/json` and `/static` rather than on the whole app.
   What that leaves out is either answered in a handful of bytes — `/pipeline`, `/baseline11`,
@@ -89,7 +94,7 @@ SO_REUSEPORT".
 - The master binds nothing. It re-executes the binary `GOMAXPROCS` times with
   `FASTHTTP_PREFORK_CHILD=1` set, then supervises: a worker that dies is replaced, until the
   cumulative number of exits passes `PreforkRecoverThreshold` (Fiber defaults it to
-  `GOMAXPROCS/2`), at which point the master gives up and the container exits with it.
+  `max(1, GOMAXPROCS/2)`), at which point the master gives up and the container exits with it.
 - On the benchmark cpuset (`0-31,64-95` — 32 physical cores, 64 hardware threads) that is 64
   workers, each dropped to `GOMAXPROCS(1)` by prefork itself: one Go runtime per hardware
   thread rather than one runtime scheduling all of them.
