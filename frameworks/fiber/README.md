@@ -57,7 +57,11 @@ profile drives them any more.
 
 - `json-tls`, `static-tls` and `8gbit` share the listener on `8081`, opened when
   `/certs/server.crt` and `/certs/server.key` are both present. It is the same router behind
-  TLS, not a second copy of the handlers.
+  TLS, not a second copy of the handlers. The keypair is loaded here and handed over as
+  `ListenConfig.TLSConfig` rather than as `CertFile`/`CertKeyFile`: that convenience path
+  installs a `TLSHandler` whose `GetCertificate` callback writes the ClientHello onto one
+  shared struct on every handshake, which `go build -race` reports as a data race under
+  concurrent handshakes — and this port is driven at 512 to 16,384 connections.
 - What the static profiles require is that the response follow the disk: replace a file and the
   next response carries the new bytes. Serving from memory is allowed in every mode, but only
   through a cache that is the framework's own — and Fiber's static middleware cannot be that

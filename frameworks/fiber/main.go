@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"log"
 	"os"
@@ -606,23 +607,41 @@ func main() {
 		_, certErr := os.Stat(cert)
 		_, keyErr := os.Stat(key)
 		if certErr == nil && keyErr == nil {
-			go func() {
-				// In a child, EnablePrefork means "take the SO_REUSEPORT socket
-				// for this address", not "fork again": fasthttp checks the
-				// child marker before it looks at anything else. Without it
-				// every worker would race for an ordinary bind on 8081 and all
-				// but one would lose it - silently, back when this dropped the
-				// error instead of logging it.
-				err := app.Listen(":8081", fiber.ListenConfig{
-					DisableStartupMessage: true,
-					CertFile:              cert,
-					CertKeyFile:           key,
-					EnablePrefork:         true,
-				})
-				if err != nil {
-					log.Printf("tls listener on :8081: %v", err)
-				}
-			}()
+			// The keypair is loaded here rather than handed to Fiber as
+			// CertFile/CertKeyFile, because that path installs a TLSHandler
+			// whose GetCertificate callback writes the ClientHello onto one
+			// shared struct on every handshake, unsynchronised (fiber
+			// ctx.go:95-98, wired at listen.go:233-241). `go build -race`
+			// reports it as a data race under concurrent handshakes, and the
+			// three profiles on this port drive 512 to 16384 connections.
+			// Nothing here reads that ClientHello. Passing TLSConfig takes the
+			// branch that clones the config as given and installs no handler;
+			// the fields are the ones Fiber would have set, ALPN left
+			// unadvertised exactly as it is today.
+			pair, pairErr := tls.LoadX509KeyPair(cert, key)
+			if pairErr != nil {
+				log.Printf("tls keypair: %v", pairErr)
+			} else {
+				go func() {
+					// In a child, EnablePrefork means "take the SO_REUSEPORT socket
+					// for this address", not "fork again": fasthttp checks the
+					// child marker before it looks at anything else. Without it
+					// every worker would race for an ordinary bind on 8081 and all
+					// but one would lose it - silently, back when this dropped the
+					// error instead of logging it.
+					err := app.Listen(":8081", fiber.ListenConfig{
+						DisableStartupMessage: true,
+						EnablePrefork:         true,
+						TLSConfig: &tls.Config{
+							MinVersion:   tls.VersionTLS12,
+							Certificates: []tls.Certificate{pair},
+						},
+					})
+					if err != nil {
+						log.Printf("tls listener on :8081: %v", err)
+					}
+				}()
+			}
 		}
 	}
 
