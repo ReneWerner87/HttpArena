@@ -89,11 +89,30 @@ profile drives them any more.
 ## Prefork
 
 `app.Listen(":8080", fiber.ListenConfig{EnablePrefork: true})` hands off to fasthttp's prefork
-manager: one worker process per CPU the container is given. Standard mode allows an entry to
-match its worker count to the hardware — "Worker/thread counts matching available CPU cores" —
-and it is the same thing Node's `cluster` module does for the `express`, `fastify` and `koa`
-entries, and what `aiohttp` describes as "one forked worker per core sharing the port with
-SO_REUSEPORT".
+manager: one worker process per CPU the container is given.
+
+### Why this is standard and not tuned
+
+- The mode's own rule page allows it twice: "Worker/thread counts matching available CPU cores"
+  under **Allowed**, and "Setting worker count to match CPU cores" under deployment-environment
+  tuning. Its **Not allowed** list — undocumented flags, experimental options, settings that
+  disable buffering or validation — covers none of this. `EnablePrefork` is a documented public
+  field, and Fiber's own documentation carries deployment guidance for it (run it inside a
+  trusted boundary, prefer container isolation), which is exactly one benchmark container.
+- The board already runs this way. `express`, `fastify` and `koa` fork one cluster worker per
+  core, `aiohttp` describes itself as "one forked worker per core sharing the port with
+  SO_REUSEPORT", and all of them are `mode: standard` — 37 standard entries fork per core or
+  take a reuseport socket.
+- The socket options that come with it are settled here too. `go-fasthttp` — flagship, standard,
+  on the same profiles — calls the identical `reuseport.Listen`, and `axum` added one
+  `SO_REUSEPORT` listener per core in
+  [#1361](https://github.com/MDA2AV/HttpArena/pull/1361) and stayed standard.
+
+The counter-argument, stated because a reviewer will find it: read literally, the `baseline`
+profile's standard rule ("no worker count beyond framework defaults", "No custom TCP tuning")
+and `short-lived`'s tuned side ("May optimize connection recycling, TCP fast-open, and socket
+reuse settings") put both halves of this on the tuned side. That reading is available — but it
+reclassifies 37 entries, `go-fasthttp` and `axum` among them, not this one alone.
 
 - The master binds nothing. It re-executes the binary `GOMAXPROCS` times with
   `FASTHTTP_PREFORK_CHILD=1` set, then supervises: a worker that dies is replaced, until the
