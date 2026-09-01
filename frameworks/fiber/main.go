@@ -65,11 +65,17 @@ func loadDataset() {
 	if path == "" {
 		path = "/data/dataset.json"
 	}
+	// Logged rather than swallowed: with no dataset every /json/{count} answers
+	// 200 with an empty list, which looks like a working server right up until
+	// the numbers are compared against the file.
 	data, err := os.ReadFile(path)
 	if err != nil {
+		log.Printf("dataset %s: %v", path, err)
 		return
 	}
-	json.Unmarshal(data, &dataset)
+	if err := json.Unmarshal(data, &dataset); err != nil {
+		log.Printf("dataset %s: %v", path, err)
+	}
 }
 
 func pipeline(c fiber.Ctx) error {
@@ -154,6 +160,7 @@ func loadPgPool() {
 	}
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
+		log.Printf("database url: %v", err)
 		return
 	}
 	budget := 256
@@ -173,6 +180,7 @@ func loadPgPool() {
 	cfg.MaxConns = int32(maxConns)
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
+		log.Printf("database pool: %v", err)
 		return
 	}
 	pgPool = pool
@@ -203,7 +211,7 @@ func queryItems(ctx context.Context, sql string, args ...any) ([]DatasetItem, er
 		var tags []byte
 		if err := rows.Scan(&it.ID, &it.Name, &it.Category, &it.Price, &it.Quantity,
 			&it.Active, &tags, &it.Rating.Score, &it.Rating.Count); err != nil {
-			continue
+			return nil, err
 		}
 		json.Unmarshal(tags, &it.Tags)
 		if it.Tags == nil {
@@ -344,9 +352,9 @@ func crudRead(c fiber.Ctx) error {
 	if pgPool == nil {
 		return c.Status(500).JSON(fiber.Map{"error": "DB not available"})
 	}
-	id, err := strconv.Atoi(c.Params("id"))
-	if err != nil {
-		return c.SendStatus(404)
+	id := fiber.Params[int](c, "id", -1)
+	if id < 0 {
+		return c.SendStatus(fiber.StatusNotFound)
 	}
 	ctx, cancel := dbContext()
 	defer cancel()
@@ -378,9 +386,9 @@ func crudUpdate(c fiber.Ctx) error {
 	if pgPool == nil {
 		return c.Status(500).JSON(fiber.Map{"error": "DB not available"})
 	}
-	id, err := strconv.Atoi(c.Params("id"))
-	if err != nil {
-		return c.SendStatus(404)
+	id := fiber.Params[int](c, "id", -1)
+	if id < 0 {
+		return c.SendStatus(fiber.StatusNotFound)
 	}
 	var b crudBody
 	if err := json.Unmarshal(c.Body(), &b); err != nil {
@@ -524,11 +532,16 @@ func main() {
 	}
 
 	if serving {
-		// SIGTERM is what `docker stop` sends between profiles, and draining
-		// beats being cut off mid-response. It is deliberately not installed in
-		// the prefork master: that process serves nothing, and taking the
-		// signal over from the runtime there would keep it alive until Docker
-		// gave up waiting and escalated to SIGKILL.
+		// A child signalled directly drains rather than being cut off
+		// mid-response. That is fasthttp's own teardown path, where the prefork
+		// master SIGTERMs its children and waits on them.
+		//
+		// `docker stop` does not take that path: it signals PID 1, which here
+		// is the master. The master serves nothing and deliberately holds no
+		// handler of its own - taking the signal over from the runtime there
+		// would keep it alive until Docker gave up waiting and escalated to
+		// SIGKILL - so it exits, and the children follow it out within one
+		// 500ms parent-pid poll.
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		listen.GracefulContext = ctx

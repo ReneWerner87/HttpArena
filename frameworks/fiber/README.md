@@ -30,8 +30,10 @@ Fiber web framework on fasthttp, with prefork for multi-core scaling.
   than globally: on the few-byte bodies of `/pipeline` and `/baseline11` it can only add a `Vary`
   header, and those are the endpoints the throughput and CPU-per-request profiles drive
 - Body limit raised to 25 MB so the in-out profile is not rejected
-- `SIGTERM` (what `docker stop` sends) drains through `ListenConfig.GracefulContext`
-  rather than cutting responses off mid-flight
+- A worker signalled directly drains through `ListenConfig.GracefulContext` rather than being
+  cut off mid-response. `docker stop` signals PID 1 — the prefork master — which holds no
+  handler of its own on purpose, so it exits and the workers follow it out within one 500 ms
+  parent-pid poll
 
 ## Added profiles
 
