@@ -389,14 +389,35 @@ const listener = {
 
 Bun.serve({ ...listener, port: 8080 });
 
-// json-tls and static-tls: the same routes over TLS on 8081. Bun negotiates
-// http/1.1 by default here - there is no h2 to fall into, which is what those
-// two profiles require of the ALPN. The harness only mounts /certs for the TLS
-// profiles, so without them this listener is simply not opened.
+// h2c on :8082 for baseline-h2c and json-h2c. `http2: true` is Bun's
+// experimental HTTP/2 flag: in cleartext it switches a connection to HTTP/2
+// when it opens with the h2 preface (prior knowledge) and answers HTTP/1.1
+// otherwise. Bun cannot refuse HTTP/1.1 here (`http1: false` needs http3), but
+// the profile drives the port with `h2load -p h2c` and validation probes it
+// with --http2-prior-knowledge, so neither can silently measure HTTP/1.1.
+Bun.serve({ ...listener, port: 8082, http2: true });
+
+// The harness only mounts /certs for the TLS profiles, so without them neither
+// TLS listener is opened and the entry still serves the plaintext profiles.
 const tlsKey = Bun.file("/certs/server.key");
 const tlsCert = Bun.file("/certs/server.crt");
 if (await tlsKey.exists() && await tlsCert.exists()) {
-    Bun.serve({ ...listener, port: 8081, tls: { key: tlsKey, cert: tlsCert } });
+    const tls = { key: tlsKey, cert: tlsCert };
+
+    // json-tls, static-tls and 8gbit: HTTP/1.1 over TLS on :8081. No http2
+    // flag on purpose - those profiles require the ALPN to settle on http/1.1,
+    // and with the flag Bun would offer h2 to a client that asks.
+    Bun.serve({ ...listener, port: 8081, tls });
+
+    // :8443 carries the HTTP/2 and HTTP/3 profiles off the same routes:
+    //   http2  - ALPN picks h2 over TCP           (baseline-h2, static-h2)
+    //   http3  - QUIC on udp/8443, Bun's own lsquic (baseline-h3, static-h3)
+    // Both flags are experimental in Bun. HTTP/1.1 stays on tcp/8443 with an
+    // Alt-Svc header, which is also what the readiness probes reach - there is
+    // no HTTP/3 client in that path. Every worker binds udp/8443 through the
+    // same reusePort and the kernel spreads QUIC connections by 4-tuple, which
+    // holds because the load generator never migrates a connection.
+    Bun.serve({ ...listener, port: 8443, tls, http2: true, http3: true });
 }
 
 console.log("Application started.");
