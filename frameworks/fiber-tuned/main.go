@@ -580,10 +580,12 @@ func main() {
 	// requests per second for a body that is serialized and compressed per
 	// request, and the profile requires valid gzip or brotli, not a ratio -
 	// the compress middleware picks brotli for the profile's "gzip, br", so
-	// this is brotli at its fastest setting, gzip at level 1 for a client
-	// that accepts only gzip. Static is unaffected either way: the twins on
-	// disk are compressed already, and the middleware leaves an encoded body
-	// alone.
+	// this is brotli level 0 instead of fasthttp's default 4, and gzip level 1
+	// instead of 6 for a client that accepts only gzip. On a sandbox core the
+	// brotli step goes from ~259 us to ~68 us for the 8.4 KB /json/50 body,
+	// at 1490 -> 1940 bytes on the wire. Static is unaffected either way: the
+	// twins on disk are compressed already, and the middleware leaves an
+	// encoded body alone.
 	app.Use([]string{"/json", "/static"}, compress.New(compress.Config{
 		Level: compress.LevelBestSpeed,
 	}))

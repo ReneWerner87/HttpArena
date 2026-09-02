@@ -1,10 +1,18 @@
 # fiber-tuned
 
-The [`fiber`](../fiber/) entry with the three changes standard mode does not
-allow and tuned mode does. The server is the same: the routes, prefork, the
-per-request static reads, the `.br`/`.gz` twin selection, the TLS listener on
-`8081`, and the drain-on-signal shutdown are all `fiber`'s, unchanged.
-`fiber`'s README documents them, and this file covers only what differs.
+The [`fiber`](../fiber/) entry with three settings the standard entry leaves at
+the framework's defaults: sonic for JSON, the compress middleware at its
+best-speed level, and a Postgres pool filled at startup. sonic is what tuned
+mode exists for and standard mode forbids. The other two are documented options
+of the middleware and the driver the standard entry already uses — `carter` and
+`salvo` run their compression at level 1 in standard mode — and they sit here
+rather than in `fiber` because that entry's line is *default configuration*,
+and a level is a configuration.
+
+The server is otherwise the same: the routes, prefork, the per-request static
+reads, the `.br`/`.gz` twin selection, the TLS listener on `8081`, and the
+drain-on-signal shutdown are all `fiber`'s, unchanged. `fiber`'s README
+documents them, and this file covers only what differs.
 
 Both entries appear on the board — `fiber` as `mode: standard`, this one as
 `mode: tuned` with the ring the board draws for tuned entries. `/benchmark`
@@ -24,6 +32,38 @@ is left at the framework's and the runtime's defaults, the same as the standard
 entry. Tuned mode would allow more; these three are the changes with a clear
 rationale and a measurable effect, and the point of the pair is to measure them
 rather than to collect knobs.
+
+## Measured
+
+Not board numbers — those come from `/benchmark` on the reference hardware.
+These are from a 4-vCPU sandbox: one prefork worker of each entry (child mode,
+`GOMAXPROCS(1)`) pinned to one core, the load generator on two others, 16
+keep-alive connections, two rounds in alternating order. The metric that matters
+is CPU per request, read from `/proc`, because it does not depend on whether the
+generator saturates the server.
+
+| request | `fiber` | `fiber-tuned` | delta |
+|---|---|---|---|
+| `/json/50?m=6`, `Accept-Encoding: gzip, br` (json-comp) | 378–386 µs, 1490 B | 145–146 µs, 1940 B | −62 % CPU, +30 % bytes |
+| `/json/50?m=6`, no encoding (json-tls, minus TLS) | 82–84 µs | 59–64 µs | −25 % CPU |
+| `/baseline11?a=13&b=42` (control, no delta touches it) | 11.3–13.3 µs | 11.4–11.5 µs | noise |
+
+The control row is what makes the other two readable: nothing in this entry
+touches `/baseline11`, and it comes out equal. On the same box, the two deltas
+in isolation (`go test -bench`, the exact 8397-byte body):
+
+| work | `fiber` | `fiber-tuned` |
+|---|---|---|
+| JSON marshal, `encoding/json` → sonic | 35.1 µs | 12.2 µs |
+| brotli, level 4 → 0 | 259 µs → 1490 B | 68 µs → 1940 B |
+| gzip, level 6 → 1 (a gzip-only client) | 62 µs → 1519 B | 33 µs → 1722 B |
+
+The sum of the isolated deltas matches the end-to-end change to within the
+framework's fixed cost per request, so the two tables are describing the same
+thing. What the first table also shows is where the standard entry's json-comp
+cost sits: brotli at fasthttp's default level 4 is about two thirds of it, and
+four times what gzip at its own default takes for a body two per cent larger.
+That is the default, and the standard entry ships the default.
 
 ### JSON: sonic
 
@@ -60,8 +100,15 @@ prefixes the standard entry mounts it on (`/json`, `/static`).
 - The profile it changes is `json-comp`, which scores requests per second for a
   body serialized and compressed per request and requires only *valid* gzip or
   brotli, not a ratio. Fiber's middleware picks brotli for the profile's
-  `Accept-Encoding: gzip, br`; best speed is brotli at its fastest level (and
-  gzip level 1 for a gzip-only client) rather than the middleware's default.
+  `Accept-Encoding: gzip, br`. `LevelDefault` maps to brotli level 4 and gzip
+  level 6 (fasthttp's `CompressBrotliDefaultCompression` and
+  `CompressDefaultCompression`); `LevelBestSpeed` maps to brotli level 0 and
+  gzip level 1. Measured above: 259 µs → 68 µs per body for brotli, at 1490 B →
+  1940 B on the wire.
+- The level is an option of the same middleware the standard entry mounts, not
+  a different library, and `carter` and `salvo` set theirs to level 1 in
+  standard mode. It could live in `fiber`; whether it should is a question
+  about what that entry is for, and this pair keeps the answer measurable.
 - Static is unaffected: the twins on disk are already compressed, and the
   middleware leaves an encoded body alone — so the level only ever applies to
   the per-request `/json` path.
@@ -79,6 +126,11 @@ already sets from `DATABASE_MAX_CONN`.
   first `async-db` requests of a run each pay for a TCP connect and a Postgres
   handshake. `MinConns` set to the pool size makes pgxpool open them at startup,
   in a background goroutine, before load arrives.
+- Whether that reaches the board is doubtful, and this README should say so:
+  each profile runs three times and the best run is kept, which discards a cold
+  start by design. The fill matters to the first requests after a container
+  starts — a real thing in production, where a deploy is a cold start under
+  live traffic — not to a steady-state score. The same goes for `pretouchJSON`.
 
 ## Build
 
