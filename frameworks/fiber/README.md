@@ -155,9 +155,10 @@ results on `main`, so the trade is a number rather than an argument.
 
 ## Tuned sibling
 
-Three settings this entry leaves at the framework's defaults — sonic behind `c.JSON`, the
-compress middleware at its best-speed level, the Postgres pool filled at startup — are set in the
-[`fiber-tuned`](../fiber-tuned/) entry, `mode: tuned`. sonic is the one standard mode forbids.
+Four things this entry leaves at the framework's defaults — sonic behind `c.JSON`, the compress
+middleware at its best-speed level, the Postgres pool filled at startup, and fasthttp at `master`
+for the go-brrr brotli it swapped in — are set in the [`fiber-tuned`](../fiber-tuned/) entry,
+`mode: tuned`. sonic is the one standard mode forbids.
 The compress level is an option of the same middleware, and `carter` and `salvo` run theirs at
 level 1 in standard mode; it stays at default here so that "default configuration" stays true,
 and its README has the numbers: on a sandbox core, json-comp costs this entry roughly 380 µs per

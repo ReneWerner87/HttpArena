@@ -1,9 +1,11 @@
-// fiber-tuned is the fiber entry with the three changes tuned mode allows and
-// standard mode does not: sonic in place of encoding/json, the compress
-// middleware at its best-speed level, and the Postgres pool opened to its full
-// size at startup rather than lazily. Everything else - the routes, prefork,
-// the static and TLS paths, the shutdown - is the standard entry's, unchanged,
-// and its README explains those.
+// fiber-tuned is the fiber entry with what the standard entry leaves at the
+// framework's defaults: sonic in place of encoding/json, the compress
+// middleware at its best-speed level, the Postgres pool opened to its full
+// size at startup rather than lazily, and - in go.mod, not here - fasthttp at
+// master instead of the v1.73.0 Fiber 3.5.0 pins, for the go-brrr brotli that
+// valyala/fasthttp#2366 swapped in. Everything else - the routes, prefork, the
+// static and TLS paths, the shutdown - is the standard entry's, unchanged, and
+// its README explains those.
 package main
 
 import (
@@ -582,10 +584,11 @@ func main() {
 	// the compress middleware picks brotli for the profile's "gzip, br", so
 	// this is brotli level 0 instead of fasthttp's default 4, and gzip level 1
 	// instead of 6 for a client that accepts only gzip. On a sandbox core the
-	// brotli step goes from ~259 us to ~68 us for the 8.4 KB /json/50 body,
-	// at 1490 -> 1940 bytes on the wire. Static is unaffected either way: the
-	// twins on disk are compressed already, and the middleware leaves an
-	// encoded body alone.
+	// brotli step for the 8.4 KB /json/50 body is ~259 us at the default on
+	// the release's library, ~107 us at the default on go-brrr, and ~26 us at
+	// level 0 on go-brrr, at 1490 -> 1944 bytes on the wire. Static is
+	// unaffected either way: the twins on disk are compressed already, and the
+	// middleware leaves an encoded body alone.
 	app.Use([]string{"/json", "/static"}, compress.New(compress.Config{
 		Level: compress.LevelBestSpeed,
 	}))
