@@ -387,15 +387,35 @@ const listener = {
     fetch: handle,
 };
 
+// The HTTP/1.1 profiles. This one is not optional: without it the entry has
+// nothing to be ready on, so a failure here should take the process down.
 Bun.serve({ ...listener, port: 8080 });
+
+// Everything below is one protocol's worth of profiles, and each is wrapped so
+// that losing it costs only its own profiles. Before these listeners existed a
+// bind failure was impossible; now a stale process on :8082 or :8443 - both
+// reachable, since the harness runs this container on --network host - would
+// otherwise throw past the top level and take the twelve HTTP/1.1 profiles
+// down with it, which reads on the board as "bun did not start" rather than
+// "bun has no h2".
+const optional = (label: string, opts: Bun.ServeOptions) => {
+    try {
+        Bun.serve(opts);
+    } catch (e) {
+        console.error(`${label} listener not started:`, e);
+    }
+};
 
 // h2c on :8082 for baseline-h2c and json-h2c. `http2: true` is Bun's
 // experimental HTTP/2 flag: in cleartext it switches a connection to HTTP/2
 // when it opens with the h2 preface (prior knowledge) and answers HTTP/1.1
-// otherwise. Bun cannot refuse HTTP/1.1 here (`http1: false` needs http3), but
-// the profile drives the port with `h2load -p h2c` and validation probes it
-// with --http2-prior-knowledge, so neither can silently measure HTTP/1.1.
-Bun.serve({ ...listener, port: 8082, http2: true });
+// otherwise. Serving both on one port is what the profile allows - see the
+// "Dual-serving h1 on the same port is allowed" section of the baseline-h2c
+// rules - and neither driver can take the h1 path by accident: the benchmark
+// runs `h2load -p h2c` and validation probes with --http2-prior-knowledge.
+// (Bun 1.4.1 would also take `http1: false` here, which answers 505 to an
+// HTTP/1.1 client; it is left off because the profile does not ask for it.)
+optional("h2c :8082", { ...listener, port: 8082, http2: true } as Bun.ServeOptions);
 
 // The harness only mounts /certs for the TLS profiles, so without them neither
 // TLS listener is opened and the entry still serves the plaintext profiles.
@@ -405,19 +425,25 @@ if (await tlsKey.exists() && await tlsCert.exists()) {
     const tls = { key: tlsKey, cert: tlsCert };
 
     // json-tls, static-tls and 8gbit: HTTP/1.1 over TLS on :8081. No http2
-    // flag on purpose - those profiles require the ALPN to settle on http/1.1,
-    // and with the flag Bun would offer h2 to a client that asks.
-    Bun.serve({ ...listener, port: 8081, tls });
+    // flag on purpose - those three profiles are measured over HTTP/1.1, and
+    // with the flag Bun would hand h2 to any client whose ALPN offers it.
+    // Without it Bun negotiates no ALPN at all here, which the posture probe
+    // accepts ("none negotiated, client falls back").
+    optional("h1+TLS :8081", { ...listener, port: 8081, tls } as Bun.ServeOptions);
 
     // :8443 carries the HTTP/2 and HTTP/3 profiles off the same routes:
     //   http2  - ALPN picks h2 over TCP           (baseline-h2, static-h2)
     //   http3  - QUIC on udp/8443, Bun's own lsquic (baseline-h3, static-h3)
-    // Both flags are experimental in Bun. HTTP/1.1 stays on tcp/8443 with an
-    // Alt-Svc header, which is also what the readiness probes reach - there is
-    // no HTTP/3 client in that path. Every worker binds udp/8443 through the
-    // same reusePort and the kernel spreads QUIC connections by 4-tuple, which
+    // Both flags are experimental in Bun. A TCP client that does not offer h2
+    // still gets HTTP/1.1 plus an Alt-Svc header, but every probe the harness
+    // points at tcp/8443 offers h2 and therefore lands on h2 - which is what
+    // baseline-h2's posture check asserts. That TCP side is also the only way
+    // the harness can see this entry is up, since nothing in the readiness
+    // path speaks QUIC. Every worker binds udp/8443 through the same
+    // reusePort and the kernel spreads QUIC connections by 4-tuple, which
     // holds because the load generator never migrates a connection.
-    Bun.serve({ ...listener, port: 8443, tls, http2: true, http3: true });
+    optional("h2+h3 :8443",
+        { ...listener, port: 8443, tls, http2: true, http3: true } as Bun.ServeOptions);
 }
 
 console.log("Application started.");
